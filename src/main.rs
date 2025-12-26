@@ -197,6 +197,7 @@ fn parse<T: BufRead>(
     timestamp: OffsetDateTime,
     max_out_len: usize,
     discovery_info: DiscoveryInfo,
+    package_name: Option<&str>,
 ) -> Result<Report> {
     let mut r = Report::new();
     let mut suite_index = 0;
@@ -227,7 +228,7 @@ fn parse<T: BufRead>(
                 SuiteEvent::Ok { results: _ } | SuiteEvent::Failed { results: _ } => {
                     assert_eq!(None, tests.iter().next());
                     let mut suite = current_suite_maybe.take().expect("Suite complete event found outside of suite!");
-                    post_process_testsuite(&mut suite, suite_name_prefix);
+                    post_process_testsuite(&mut suite, suite_name_prefix, package_name);
                     r.add_testsuite(suite);
                 }
                 SuiteEvent::DiscoveryStarted | SuiteEvent::DiscoveryCompleted { .. } => {
@@ -336,7 +337,11 @@ fn parse<T: BufRead>(
     Ok(r)
 }
 
-fn post_process_testsuite(testsuite: &mut TestSuite, suite_name_prefix: Option<&str>) {
+fn post_process_testsuite(
+    testsuite: &mut TestSuite,
+    suite_name_prefix: Option<&str>,
+    package_name: Option<&str>,
+) {
     use std::path::{Path, MAIN_SEPARATOR};
 
     // Determine package name as a common prefix for all file paths in the testcases
@@ -372,10 +377,15 @@ fn post_process_testsuite(testsuite: &mut TestSuite, suite_name_prefix: Option<&
             if let Some(suite_name_prefix) = suite_name_prefix {
                 testsuite.name = format!("{suite_name_prefix} {prefix}");
             } else {
-                testsuite.name = prefix.clone();
-            }
-            testsuite.package = prefix;
+                testsuite.name = prefix;
+            };
         }
+    }
+
+    if let Some(package_name) = package_name {
+        testsuite.package = package_name.to_string();
+    } else {
+        testsuite.package = testsuite.name.clone();
     }
 }
 
@@ -452,6 +462,11 @@ pub(crate) struct CommandLineArgs {
     /// Generate one by running `cargo test -- --list`.
     #[arg(short = 'd', long = "discovery")]
     pub(crate) discovery_file: Option<String>,
+
+    /// Package name to use for all test suites. If not passed, package name is set to
+    /// the suite name for each test suite.
+    #[arg(short = 'p', long = "package")]
+    pub(crate) package_name: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -483,6 +498,7 @@ fn main() -> Result<()> {
         timestamp,
         max_out_len,
         discovery_info,
+        args.package_name.as_deref(),
     )?;
 
     let stdout = std::io::stdout();
@@ -510,6 +526,7 @@ mod tests {
             OffsetDateTime::now_utc(),
             max_stdout_len,
             Default::default(),
+            None,
         )
     }
 

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
-  <testsuite id="0" name="cargo test #0" package="testsuite/cargo test #0" tests="25" errors="0" failures="0" hostname="localhost" timestamp="2025-12-26T14:19:44.540710944Z" time="0">
+  <testsuite id="0" name="cargo test #0" package="cargo test #0" tests="25" errors="0" failures="0" hostname="localhost" timestamp="2025-12-26T16:21:10.192355282Z" time="0">
     <testcase name="bad_parsing" time="0" classname="core::package_id_spec::tests" />
     <testcase name="good_parsing" time="0" classname="core::package_id_spec::tests" />
     <testcase name="invalid_version_handled_nicely" time="0" classname="core::package_id::tests" />
@@ -27,7 +27,7 @@
     <testcase name="with_retry_finds_nested_spurious_errors" time="0" classname="util::network" />
     <testcase name="test_lev_distance" time="0" classname="util::lev_distance" />
   </testsuite>
-  <testsuite id="1" name="cargo test #1" package="testsuite/cargo test #1" tests="1507" errors="0" failures="2" hostname="localhost" timestamp="2025-12-26T14:19:44.540710944Z" time="0">
+  <testsuite id="1" name="cargo test #1" package="cargo test #1" tests="1507" errors="0" failures="2" hostname="localhost" timestamp="2025-12-26T16:21:10.192355282Z" time="0">
     <testcase name="bad_registry_name" time="0" classname="alt_registry" />
     <testcase name="aaa_trigger_cross_compile_disabled_check" time="0" classname="">
       <failure type="cargo test" message="failed ::aaa_trigger_cross_compile_disabled_check"><![CDATA[thread 'aaa_trigger_cross_compile_disabled_check' panicked at 'Cannot cross compile to i686-pc-windows-msvc.
