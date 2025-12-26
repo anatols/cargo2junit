@@ -89,6 +89,11 @@ enum Event {
         duration: Option<f64>,
         exec_time: Option<ExecTime>,
     },
+    #[serde(rename = "report")]
+    DoctestsReport {
+        total_time: f64,
+        compilation_time: f64,
+    }
 }
 
 impl Event {
@@ -120,7 +125,8 @@ impl Event {
                 };
                 
                 Duration::nanoseconds(duration_ns)
-            }
+                },
+            Event::DoctestsReport { .. } => panic!(),
         }
     }
 }
@@ -273,6 +279,12 @@ fn parse<T: BufRead>(
                 }
 
                 current_suite_maybe = Some(current_suite);
+            },
+            Event::DoctestsReport { .. } => {
+                // This is an informative event that's emitted after a doctests binary is done executing.
+                // Aside from a bespoke way of compiling into a single binary, doctests are not special
+                // and produce all the same events as the regular tests. We thus should have all the required
+                // information already and can ignore this event.
             }
         }
     }
