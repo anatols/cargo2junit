@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
-  <testsuite id="0" name="cargo test #0" package="testsuite/cargo test #0" tests="2" errors="0" failures="1" hostname="localhost" timestamp="2022-07-26T19:36:56.870302817Z" time="0">
+  <testsuite id="0" name="cargo test #0" package="testsuite/cargo test #0" tests="2" errors="0" failures="1" hostname="localhost" timestamp="2025-12-26T14:19:44.643148658Z" time="0">
     <testcase name="fails" time="0" classname="tests">
       <failure type="cargo test" message="failed tests::fails"><![CDATA[thread 'tests::fails' panicked at 'assertion failed: `(left == right)`
   left: `4`,

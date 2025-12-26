@@ -4,7 +4,7 @@ extern crate serde;
 use junit_report::*;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::io::*;
 
@@ -31,6 +31,15 @@ enum SuiteEvent {
         #[serde(flatten)]
         results: SuiteResults,
     },
+    #[serde(rename = "discovery")]
+    DiscoveryStarted,
+    #[serde(rename = "completed")]
+    DiscoveryCompleted {
+        tests: usize,
+        benchmarks: usize,
+        total: usize,
+        ignored: usize,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -41,7 +50,6 @@ enum TestEvent {
     #[serde(rename = "ok")]
     Ok { 
         name: String,
-
     },
     #[serde(rename = "failed")]
     Failed {
@@ -53,8 +61,18 @@ enum TestEvent {
     Ignored { name: String },
     #[serde(rename = "timeout")]
     Timeout { name: String },
+    #[serde(rename = "discovered")]
+    Discovered {
+        name: String,
+        ignore: bool,
+        ignore_message: String,
+        source_path: String,
+        start_line: usize,
+        start_col: usize,
+        end_line: usize,
+        end_col: usize,
+    },
 }
-
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(untagged)]
@@ -65,13 +83,16 @@ enum ExecTime {
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(untagged)]
+#[allow(clippy::enum_variant_names)]
 enum MaybeTypedEvent {
     HasKnownTypeField(Event),
-    HasUnknownTypeField{
+    HasUnknownTypeField {
         #[serde(rename = "type")]
-        type_field: String
+        type_field: String,
+        #[serde(default)]
+        event: String,
     },
-    NoTypeField(serde_json::Value)
+    NoTypeField(serde_json::Value),
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -93,7 +114,7 @@ enum Event {
     DoctestsReport {
         total_time: f64,
         compilation_time: f64,
-    }
+    },
 }
 
 impl Event {
@@ -138,11 +159,44 @@ fn split_name(full_name: &str) -> (&str, String) {
     (name, module_path)
 }
 
+fn parse_event(line: &str) -> Result<Option<Event>> {
+    if line.chars().find(|c| !c.is_whitespace()) != Some('{') {
+        return Ok(None);
+    }
+
+    let e: MaybeTypedEvent = match serde_json::from_str(line) {
+        Ok(event) => Ok(event),
+        Err(orig_err) => {
+            // cargo test doesn't escape backslashes to do it ourselves and retry
+            let line = line.replace('\\', "\\\\");
+            match serde_json::from_str(&line) {
+                Ok(event) => Ok(event),
+                Err(_) => Err(Error::other(format!(
+                    "Error parsing '{}': {}",
+                    &line, orig_err
+                ))),
+            }
+        }
+    }?;
+
+    match e {
+        MaybeTypedEvent::HasKnownTypeField(e) => Ok(Some(e)),
+        MaybeTypedEvent::HasUnknownTypeField { type_field, event } => {
+            panic!("Unknown event type: '{}', event: {}", &type_field, &event);
+        }
+        MaybeTypedEvent::NoTypeField(..) => {
+            // JSON output from something else
+            Ok(None)
+        }
+    }
+}
+
 fn parse<T: BufRead>(
     input: T,
-    suite_name_prefix: &str,
+    suite_name_prefix: Option<&str>,
     timestamp: OffsetDateTime,
     max_out_len: usize,
+    discovery_info: DiscoveryInfo,
 ) -> Result<Report> {
     let mut r = Report::new();
     let mut suite_index = 0;
@@ -152,34 +206,8 @@ fn parse<T: BufRead>(
     for line in input.lines() {
         let line = line?;
 
-        if line.chars().find(|c| !c.is_whitespace()) != Some('{') {
+        let Some(e) = parse_event(&line)? else {
             continue;
-        }
-
-        let e: MaybeTypedEvent = match serde_json::from_str(&line) {
-            Ok(event) => Ok(event),
-            Err(orig_err) => {
-                // cargo test doesn't escape backslashes to do it ourselves and retry
-                let line = line.replace('\\', "\\\\");
-                match serde_json::from_str(&line) {
-                    Ok(event) => Ok(event),
-                    Err(_) => Err(Error::new(
-                        ErrorKind::Other,
-                        format!("Error parsing '{}': {}", &line, orig_err),
-                    )),
-                }
-            }
-        }?;
-
-        let e = match e {
-            MaybeTypedEvent::HasKnownTypeField(e) => e,
-            MaybeTypedEvent::HasUnknownTypeField { type_field } => {
-                panic!("Unknown event type: '{}'", &type_field);
-            },
-            MaybeTypedEvent::NoTypeField(..) => {
-                // JSON output from something else
-                continue;
-            },
         };
 
         // println!("{:?}", e);
@@ -188,17 +216,22 @@ fn parse<T: BufRead>(
                 SuiteEvent::Started { test_count: _ } => {
                     assert!(current_suite_maybe.is_none());
                     assert!(tests.is_empty());
-                    let mut ts = TestSuite::new(&format!("{} #{}", suite_name_prefix, suite_index));
+                    // We're using a default name here, but we might change it after all tests are done
+                    // based on discovery info.
+                    let mut ts = TestSuite::new(&format!("{} #{}",
+                        suite_name_prefix.unwrap_or("cargo test"), suite_index));
                     ts.set_timestamp(timestamp);
                     current_suite_maybe = Some(ts);
                     suite_index += 1;
                 }
                 SuiteEvent::Ok { results: _ } | SuiteEvent::Failed { results: _ } => {
                     assert_eq!(None, tests.iter().next());
-                    r.add_testsuite(
-                        current_suite_maybe.expect("Suite complete event found outside of suite!"),
-                    );
-                    current_suite_maybe = None;
+                    let mut suite = current_suite_maybe.take().expect("Suite complete event found outside of suite!");
+                    post_process_testsuite(&mut suite, suite_name_prefix);
+                    r.add_testsuite(suite);
+                }
+                SuiteEvent::DiscoveryStarted | SuiteEvent::DiscoveryCompleted { .. } => {
+                    panic!("Unexpected suite discovery event in test results")
                 }
             },
             Event::Test {
@@ -216,20 +249,21 @@ fn parse<T: BufRead>(
                     TestEvent::Started { name } => {
                         assert!(tests.insert(name.clone()));
                     }
-                    TestEvent::Ok { name } => {
-                        assert!(tests.remove(name));
-                        let (name, module_path) = split_name(name);
+                    TestEvent::Ok { name: full_name } => {
+                        assert!(tests.remove(full_name));
+                        let (name, module_path) = split_name(full_name);
                         let mut tc = TestCase::success(name, duration);
                         tc.set_classname(module_path.as_str());
+                        discovery_info.update_testcase(full_name, &mut tc);
                         current_suite.add_testcase(tc);
                     }
                     TestEvent::Failed {
-                        name,
+                        name: full_name,
                         stdout,
                         stderr,
                     } => {
-                        assert!(tests.remove(name));
-                        let (name, module_path) = split_name(name);
+                        assert!(tests.remove(full_name));
+                        let (name, module_path) = split_name(full_name);
 
                         let mut failure = TestCase::failure(
                             name,
@@ -238,6 +272,7 @@ fn parse<T: BufRead>(
                             &format!("failed {}::{}", module_path.as_str(), &name),
                         );
                         failure.set_classname(module_path.as_str());
+                        discovery_info.update_testcase(full_name, &mut failure);
 
                         fn truncate(s: &str, max_len: usize) -> Cow<'_, str> {
                             if s.len() > max_len {
@@ -264,9 +299,15 @@ fn parse<T: BufRead>(
 
                         current_suite.add_testcase(failure);
                     }
-                    TestEvent::Ignored { name } => {
-                        assert!(tests.remove(name));
-                        current_suite.add_testcase(TestCase::skipped(name));
+                    TestEvent::Ignored { name: full_name } => {
+                        assert!(tests.remove(full_name));
+                        let (name, module_path) = split_name(full_name);
+                        let mut tc = TestCase::skipped(name);
+                        if !module_path.is_empty() {
+                            tc.set_classname(module_path.as_str());
+                        }
+                        discovery_info.update_testcase(full_name, &mut tc);
+                        current_suite.add_testcase(tc);
                     }
                     TestEvent::Timeout { name: _ } => {
                         // An informative timeout event is emitted after a test has been running for
@@ -276,10 +317,13 @@ fn parse<T: BufRead>(
                         // action if hard timeouts that cancel and fail the test should be specified
                         // during or before stabilization of the JSON format.
                     }
+                    TestEvent::Discovered { .. } => {
+                        panic!("Unexpected test discovery event in test results")
+                    }
                 }
 
                 current_suite_maybe = Some(current_suite);
-            },
+            }
             Event::DoctestsReport { .. } => {
                 // This is an informative event that's emitted after a doctests binary is done executing.
                 // Aside from a bespoke way of compiling into a single binary, doctests are not special
@@ -292,22 +336,132 @@ fn parse<T: BufRead>(
     Ok(r)
 }
 
+fn post_process_testsuite(testsuite: &mut TestSuite, suite_name_prefix: Option<&str>) {
+    use std::path::{Path, MAIN_SEPARATOR};
+
+    // Determine package name as a common prefix for all file paths in the testcases
+    let mut maybe_prefix: Option<Vec<&std::ffi::OsStr>> = None;
+    for testcase in testsuite.testcases.iter() {
+        match (&mut maybe_prefix, &testcase.filepath) {
+            (None, Some(path)) => {
+                maybe_prefix.replace(Path::new(path).iter().collect());
+            },
+            (Some(ref mut prefix), Some(path)) => {
+                let common_len = prefix.iter().zip(Path::new(path).iter()).take_while(|(a, b)| *a == b).count();
+                prefix.truncate(common_len);
+            }
+            (_, None) => {}
+        }
+    }
+
+    if let Some(mut prefix) = maybe_prefix {
+        // Strip common suffixes that don't add much to report readability
+        prefix.pop_if(|p| *p == "mod.rs");
+        prefix.pop_if(|p| *p == "lib.rs");
+        prefix.pop_if(|p| *p == "src");
+        let size = prefix.iter().map(|p| p.len()).sum::<usize>() + prefix.len();
+        let prefix = prefix.iter().fold(String::with_capacity(size), |mut acc, p| {
+            if !acc.is_empty() {
+                acc.push(MAIN_SEPARATOR);
+            }
+            acc.push_str(p.to_str().unwrap_or("?"));
+            acc
+        });
+
+        if !prefix.is_empty() {
+            if let Some(suite_name_prefix) = suite_name_prefix {
+                testsuite.name = format!("{suite_name_prefix} {prefix}");
+            } else {
+                testsuite.name = prefix.clone();
+            }
+            testsuite.package = prefix;
+        }
+    }
+}
+
 fn determine_exit_code(report: &Report) -> Result<()> {
     if report.testsuites().is_empty() {
-        Err(Error::new(ErrorKind::NotFound, "No test suite results were found.".to_owned()))
+        Err(Error::new(
+            ErrorKind::NotFound,
+            "No test suite results were found.".to_owned(),
+        ))
     } else if report
         .testsuites()
         .iter()
         .flat_map(|suite| suite.testcases().iter())
         .any(|testcase| testcase.is_error() || testcase.is_failure())
     {
-        Err(Error::new(ErrorKind::Other, "One or more tests failed.".to_owned()))
+        Err(Error::other("One or more tests failed.".to_owned()))
     } else {
         Ok(())
     }
 }
 
+#[derive(Default)]
+struct DiscoveryInfo {
+    test_info_by_test_name: HashMap<String, DiscoveryTestInfo>,
+}
+
+impl DiscoveryInfo {
+    fn update_testcase(&self, full_test_name: &str, testcase: &mut TestCase) {
+        if let Some(info) = self.test_info_by_test_name.get(full_test_name) {
+            testcase.set_filepath(&info.file);
+        }
+    }
+}
+
+struct DiscoveryTestInfo {
+    file: String,
+}
+
+fn load_discovery_info(discovery_file: &str) -> Result<DiscoveryInfo> {
+    let input = BufReader::new(std::fs::File::open(discovery_file)?);
+
+    let mut discovery_info: DiscoveryInfo = Default::default();
+    for line in input.lines() {
+        let line = line?;
+
+        let Some(e) = parse_event(&line)? else {
+            continue;
+        };
+
+        match e {
+            Event::Suite {
+                event: SuiteEvent::DiscoveryStarted | SuiteEvent::DiscoveryCompleted { .. },
+            } => {}
+            Event::Test {
+                event: TestEvent::Discovered { name, source_path, .. }, ..
+            } => {
+                discovery_info
+                    .test_info_by_test_name
+                    .insert(name, DiscoveryTestInfo { file: source_path });
+            }
+            Event::DoctestsReport { .. } => {}
+            _ => panic!("Unexpected test result event in discovery results: {e:?}"),
+        }
+    }
+
+    Ok(discovery_info)
+}
+
+#[derive(clap::Parser, Debug)]
+#[command(name = "cargo2junit")]
+/// Converts cargo's json output (from stdin) to JUnit XML (to stdout).
+pub(crate) struct CommandLineArgs {
+    /// Path to a "discovery" file that is used to figure out better suite and test names.
+    /// Generate one by running `cargo test -- --list`.
+    #[arg(short = 'd', long = "discovery")]
+    pub(crate) discovery_file: Option<String>,
+}
+
 fn main() -> Result<()> {
+    let args: CommandLineArgs = clap::Parser::parse();
+    let discovery_info = if let Some(discovery_file) = &args.discovery_file {
+        load_discovery_info(discovery_file)?
+    } else {
+        DiscoveryInfo::default()
+    };
+
     let timestamp = OffsetDateTime::now_utc();
     let stdin = std::io::stdin();
     let stdin = stdin.lock();
@@ -321,15 +475,21 @@ fn main() -> Result<()> {
     };
 
     // Lets someone running many tests specify a custom suite name prefix
-    let suite_name_prefix = env::var("TEST_SUITE_NAME_PREFIX").unwrap_or_else(|_| "cargo test".to_owned());
+    let suite_name_prefix = env::var("TEST_SUITE_NAME_PREFIX").ok();
 
-    let report = parse(stdin, &suite_name_prefix, timestamp, max_out_len)?;
+    let report = parse(
+        stdin,
+        suite_name_prefix.as_deref(),
+        timestamp,
+        max_out_len,
+        discovery_info,
+    )?;
 
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     report
         .write_xml(&mut stdout)
-        .map_err(|e| Error::new(ErrorKind::Other, format!("{}", e)))?;
+        .map_err(|e| Error::other(format!("{}", e)))?;
     writeln!(stdout)?;
 
     determine_exit_code(&report)
@@ -338,7 +498,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::SYSTEM_OUT_MAX_LEN;
-    use crate::{parse, determine_exit_code};
+    use crate::{determine_exit_code, parse};
     use junit_report::*;
     use regex::Regex;
     use std::io::*;
@@ -346,9 +506,10 @@ mod tests {
     fn parse_bytes(bytes: &[u8], max_stdout_len: usize) -> Result<Report> {
         parse(
             BufReader::new(bytes),
-            "cargo test",
+            None,
             OffsetDateTime::now_utc(),
             max_stdout_len,
+            Default::default(),
         )
     }
 

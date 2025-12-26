@@ -19,6 +19,12 @@ RUSTC_BOOTSTRAP=1 cargo test -- -Z unstable-options --format json --report-time 
 cat results.json | cargo2junit > results.xml
 ```
 
+You can enhance your report by first running a "test discovery", then feeding the discovery info to cargo2junit for the actual test run. "Test discovery" is basically just running tests with `--list` argument. That produces extra metadata that's not available to cargo2junit during a normal test run (e.g. paths to files where tests are implemented). The tests themselves are not executed if you specify `--list`. It means you need to run them in two stages:
+```
+RUSTC_BOOTSTRAP=1 cargo test -- -Z unstable-options --format json --list > discovery.json
+RUSTC_BOOTSTRAP=1 cargo test -- -Z unstable-options --format json --report-time | cargo2junit -d discovery.json > results.xml
+```
+
 Once you have your XML, publish it (e.g. for Azure Pipelines):
 ```
   - task: PublishTestResults@2
